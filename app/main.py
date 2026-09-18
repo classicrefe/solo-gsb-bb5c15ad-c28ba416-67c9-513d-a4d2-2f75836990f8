@@ -9,8 +9,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Query, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from . import database, engine
-from .models import SimulationList, SimulationRequest, SimulationResult
+from . import blend, database, engine
+from .models import (
+    BlendPlanRequest,
+    BlendPlanResult,
+    SimulationList,
+    SimulationRequest,
+    SimulationResult,
+)
 
 
 @asynccontextmanager
@@ -31,8 +37,10 @@ app = FastAPI(
         "同一时刻的连续转移按批原子执行：吸取均基于批次开始快照，"
         "先按源管汇总校验可用量，再按批末净体积统一校验各管 max_volume，"
         "然后统一写入，结果与数组顺序无关；任一管超容整批不落地。"
+        "对成功的模拟还可请求两源管混样配比（blend-plan）：按目标体积与"
+        "目标浓度联立各标记物质量守恒方程，反推两路取样量。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -143,3 +151,87 @@ def list_simulations(
     if status_filter:
         items = [item for item in items if item["status"] == status_filter]
     return SimulationList(items=items, limit=limit, offset=offset)
+
+
+def _blend_error(
+    http_status: int, code: str, message: str, location: str
+) -> JSONResponse:
+    """配比接口的统一结构化错误（与 404 SIMULATION_NOT_FOUND 同构）。"""
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "detail": {"code": code, "message": message, "location": location}
+        },
+    )
+
+
+@app.post(
+    "/api/simulations/{sim_id}/blend-plan",
+    tags=["配比"],
+    response_model=BlendPlanResult,
+    responses={
+        200: {"model": BlendPlanResult, "description": "配比求解成功"},
+        400: {"description": "目标无解（方程不一致 / 负取样量）、源管余量不足或模拟未成功"},
+        404: {"description": "模拟记录或源管不存在"},
+        422: {"description": "请求体格式 / 字段校验失败（FastAPI 标准错误结构）"},
+    },
+    summary="从成功模拟末态的两支源管反推混样配比",
+)
+def create_blend_plan(
+    sim_id: str,
+    request: BlendPlanRequest,
+    db: sqlite3.Connection = Depends(get_db),
+) -> JSONResponse | BlendPlanResult:
+    """按目标体积与目标浓度反推两路取样量。
+
+    联立 ``x1 + x2 = target_volume`` 与每种标记物的质量守恒方程
+    （缺失标记物按 0），校验取样量非负且不超过两管末态可用体积；
+    各标记物方程不一致或目标超出可混合范围时返回带定位信息的结构化
+    错误。配比只是计算结果，不落库、不改变已保存的模拟。
+    """
+    record = database.get_simulation(db, sim_id)
+    if record is None:
+        return _blend_error(
+            status.HTTP_404_NOT_FOUND,
+            "SIMULATION_NOT_FOUND",
+            f"未找到 id 为 {sim_id!r} 的模拟记录",
+            "path.sim_id",
+        )
+    if record["status"] != "success":
+        return _blend_error(
+            status.HTTP_400_BAD_REQUEST,
+            "SIMULATION_NOT_SUCCESSFUL",
+            f"模拟 {sim_id!r} 的状态为 {record['status']!r}，仅支持对成功模拟"
+            f"的末态求配比",
+            "path.sim_id",
+        )
+
+    final_states = {tube["id"]: tube for tube in record["final_states"]}
+    for index, tube_id in enumerate(request.source_tubes):
+        if tube_id not in final_states:
+            return _blend_error(
+                status.HTTP_404_NOT_FOUND,
+                "SOURCE_TUBE_NOT_FOUND",
+                f"模拟 {sim_id!r} 的末态中不存在源管 {tube_id!r}",
+                f"source_tubes[{index}]",
+            )
+
+    try:
+        plan = blend.solve_blend_plan(
+            final_states[request.source_tubes[0]],
+            final_states[request.source_tubes[1]],
+            request.target_volume,
+            request.target_concentrations,
+        )
+    except blend.BlendPlanError as exc:
+        return _blend_error(
+            status.HTTP_400_BAD_REQUEST, exc.code, exc.message, exc.location
+        )
+
+    return BlendPlanResult(
+        simulation_id=sim_id,
+        source_tubes=request.source_tubes,
+        target_volume=request.target_volume,
+        target_concentrations=request.target_concentrations,
+        **plan,
+    )

@@ -360,3 +360,81 @@ class SimulationList(BaseModel):
     items: list[SimulationSummary]
     limit: int
     offset: int
+
+
+# ---------- 两源管混样配比（blend plan） ----------
+
+
+class BlendPlanRequest(BaseModel):
+    """配比请求：从成功模拟末态的两支源管取样，配出目标体积与目标浓度。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_tubes: list[str] = Field(
+        ...,
+        min_length=2,
+        max_length=2,
+        description="两支不同源管的 id（取自该模拟的末态管），顺序对应 aliquots 输出",
+    )
+    target_volume: float = Field(
+        ..., gt=0, description="目标总体积（两路取样量之和，单位与模拟一致）"
+    )
+    target_concentrations: dict[str, float] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "目标各标记物浓度；未列出的标记物按 0 处理（即要求混合后不含该标记物）"
+        ),
+    )
+
+    @field_validator("source_tubes")
+    @classmethod
+    def _validate_source_tubes(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("source_tubes 中的管 id 不能为空字符串")
+        if normalized[0] == normalized[1]:
+            raise ValueError("source_tubes 必须是两支不同的源管")
+        return normalized
+
+    @field_validator("target_volume")
+    @classmethod
+    def _finite_target_volume(cls, value: float) -> float:
+        return _finite_number(value, "target_volume")
+
+    @field_validator("target_concentrations")
+    @classmethod
+    def _validate_target_concentrations(
+        cls, markers: dict[str, float]
+    ) -> dict[str, float]:
+        normalized: dict[str, float] = {}
+        for name, raw in markers.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("标记物名称必须是非空字符串")
+            value = float(raw)
+            _finite_number(value, f"标记物 {name!r} 的目标浓度")
+            if value < 0:
+                raise ValueError(f"标记物 {name!r} 的目标浓度不能为负")
+            normalized[name.strip()] = value
+        return normalized
+
+
+class BlendAliquotOut(BaseModel):
+    tube_id: str
+    volume: float = Field(..., description="从该源管取样的体积")
+
+
+class BlendPlanResult(BaseModel):
+    simulation_id: str
+    source_tubes: list[str]
+    target_volume: float
+    target_concentrations: dict[str, float]
+    aliquots: list[BlendAliquotOut] = Field(
+        ..., description="两路取样量，顺序与 source_tubes 一致"
+    )
+    expected_concentrations: dict[str, float] = Field(
+        ..., description="按解出的取样量混合后，全部标记物（含未列出、为 0 的）的预计浓度"
+    )
+    remaining_volumes: dict[str, float] = Field(
+        ..., description="取样后两支源管的剩余体积（基于模拟末态）"
+    )

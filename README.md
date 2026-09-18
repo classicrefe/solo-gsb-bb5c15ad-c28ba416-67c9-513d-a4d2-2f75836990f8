@@ -19,6 +19,10 @@
   任一管超容则**整批不落地**并返回 400；未配置容量的旧请求行为不变；
 * 两个口径的守恒量：含 waste 的**系统总量差**（应恒为 0）与仅看管内的
   **管内体积 / 质量变化**（恰好等于累计损耗）。
+* **两源管混样配比（blend-plan）**：对成功模拟的末态任选两支源管，按
+  `target_volume` 与 `target_concentrations` 联立各标记物的质量守恒
+  方程（缺失标记物按 0）反推两路取样量，返回取样量、预计各标记物浓度
+  与取样后剩余体积；目标无解时给出带定位的结构化错误。
 
 转移量超出当前可用体积、注入后超过管容量（`max_volume`）、时间逆序、引用
 未声明的样本时，返回 **HTTP 400** 和定位明确的结构化错误（如
@@ -185,6 +189,71 @@ curl -s -X POST http://localhost:8000/api/simulations \
 * 容量按**实际入管量** `delivered_amount` 判断：吸出多、损耗大时只要入管后
   不超容即合法（恰好等于 `max_volume` 也合法）。
 
+### 启动后的示例（两源管混样配比 blend-plan）
+
+对**成功**模拟的末态，可让服务反推“从两支源管各取多少”才能配出目标体积
+与目标浓度。先提交一次模拟（S1 只含 GFP、S2 只含 RFP，转移 20 后末态为
+S1：80 @ GFP10；S2：100 @ GFP2 / RFP3.2）：
+
+```bash
+# 1) 提交模拟，记下返回的 id
+curl -s -X POST http://localhost:8000/api/simulations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "blend-plan 示例-末态",
+    "samples": [
+      {"id": "S1", "initial_volume": 100, "markers": {"GFP": 10}},
+      {"id": "S2", "initial_volume": 80, "markers": {"RFP": 4}}
+    ],
+    "transfers": [
+      {"time": 1, "source": "S1", "target": "S2", "amount": 20}
+    ]
+  }' | python3 -m json.tool
+
+# 2) 反推配比：目标 20 体积、GFP=6 / RFP=1.6
+curl -s -X POST http://localhost:8000/api/simulations/<id>/blend-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_tubes": ["S1", "S2"],
+    "target_volume": 20,
+    "target_concentrations": {"GFP": 6, "RFP": 1.6}
+  }' | python3 -m json.tool
+```
+
+成功响应（200）：
+
+```json
+{
+  "simulation_id": "<id>",
+  "source_tubes": ["S1", "S2"],
+  "target_volume": 20.0,
+  "target_concentrations": {"GFP": 6.0, "RFP": 1.6},
+  "aliquots": [
+    {"tube_id": "S1", "volume": 10.0},
+    {"tube_id": "S2", "volume": 10.0}
+  ],
+  "expected_concentrations": {"GFP": 6.0, "RFP": 1.6},
+  "remaining_volumes": {"S1": 70.0, "S2": 90.0}
+}
+```
+
+要点：
+
+* 联立 `x1 + x2 = target_volume` 与每种标记物的质量守恒
+  `c1·x1 + c2·x2 = target·target_volume` 求解；`target_concentrations`
+  未列出的标记物按 0 处理（即要求混合后不含它）；
+* `expected_concentrations` 覆盖全部标记物（含未列出、为 0 的），
+  `remaining_volumes` 为取样后两源管的剩余体积；
+* 各标记物方程不一致（如把上例 `RFP` 改成 `2.0`）返回 **400**，
+  `detail.code = BLEND_TARGET_INCONSISTENT`、`detail.location` 定位到
+  冲突的标记物（如 `target_concentrations.RFP`）；目标超出两源管可混合
+  范围（解出负取样量）为 `BLEND_TARGET_UNREACHABLE`，取样量超过某管末态
+  余量为 `BLEND_INSUFFICIENT_VOLUME`（`location` 形如 `source_tubes[0]`）；
+* 模拟不存在（404 `SIMULATION_NOT_FOUND`）、源管不在末态中
+  （404 `SOURCE_TUBE_NOT_FOUND`）、模拟未成功
+  （400 `SIMULATION_NOT_SUCCESSFUL`）同样返回结构化错误；
+* 配比只是基于已保存末态的**计算结果**，不落库、不改变任何模拟记录。
+
 ---
 
 ## 本地开发（不使用 Docker）
@@ -270,6 +339,18 @@ pytest -q
       * 某批失败时仅该批不落地，之前批次已提交的步骤与状态保留
         （`TIME_NOT_ORDERED` / `UNKNOWN_SAMPLE` / `SAME_SOURCE_TARGET`
         / `TUBE_OVER_CAPACITY` 同理，下标均指向原 transfers 序列）。
+11. **两源管混样配比（blend-plan）**：对成功模拟的末态任选两支源管，
+    联立体积守恒 `x1 + x2 = target_volume` 与每种标记物的质量守恒
+    `c1·x1 + c2·x2 = target·target_volume`（源管或目标中缺失的标记物
+    一律按 0）反推两路取样量。任一 `c1 ≠ c2` 的标记物都给出一个候选
+    `x1`，所有候选必须在浮点容差内一致，否则 400
+    `BLEND_TARGET_INCONSISTENT`；`c1 == c2` 的标记物要求目标浓度等于
+    该共同浓度（两管都不含某标记物而目标要求非零时同样在此拦截）。
+    解出后校验非负（负值说明目标超出两源管可混合范围，
+    `BLEND_TARGET_UNREACHABLE`）且不超过两管末态可用体积
+    （`BLEND_INSUFFICIENT_VOLUME`）。若所有标记物两管浓度一致（拆分
+    不唯一），按“优先从第一支源管取”给出确定解。配比只是计算结果，
+    不落库、不改变已保存的模拟。
 
 标记物支持两种写法，可混用：
 
@@ -285,6 +366,7 @@ pytest -q
 | `POST` | `/api/simulations` | 提交一次模拟（成功 201，业务失败 400，格式错误 422） |
 | `GET` | `/api/simulations/{id}` | 查询某次模拟的完整逐步结果（失败记录返回 400） |
 | `GET` | `/api/simulations` | 历史记录列表，支持 `limit` / `offset` / `status` |
+| `POST` | `/api/simulations/{id}/blend-plan` | 从成功模拟末态的两支源管反推混样配比（成功 200，无解 / 余量不足 400，模拟或源管不存在 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 请求示例
@@ -458,6 +540,22 @@ time_batch 下若同批对同一源管的合计吸取量超过其批次开始体
 | `SAME_SOURCE_TARGET` | 源管与目标管相同 | `transfers[i]` |
 | `SIMULATION_NOT_FOUND` | 查询不存在的记录 id | `path.sim_id` |
 
+blend-plan 接口（`POST /api/simulations/{id}/blend-plan`）的错误同样为
+`{"detail": {code, message, location}}` 结构：
+
+| code | 触发条件 | HTTP | location 示例 |
+| --- | --- | --- | --- |
+| `SIMULATION_NOT_FOUND` | 模拟记录不存在 | 404 | `path.sim_id` |
+| `SIMULATION_NOT_SUCCESSFUL` | 模拟业务结果为失败，无法取末态配比 | 400 | `path.sim_id` |
+| `SOURCE_TUBE_NOT_FOUND` | `source_tubes` 引用了末态中不存在的管 | 404 | `source_tubes[i]` |
+| `BLEND_TARGET_INCONSISTENT` | 各标记物方程不一致（含两管浓度相同 / 均不含某标记物而目标要求不同） | 400 | `target_concentrations.<marker>` |
+| `BLEND_TARGET_UNREACHABLE` | 解出负取样量，目标超出两源管可混合范围 | 400 | `target_concentrations` |
+| `BLEND_INSUFFICIENT_VOLUME` | 取样量超过源管末态可用体积 | 400 | `source_tubes[i]` |
+
+请求体字段问题（源管数量不是 2 / 两支相同、`target_volume` 非正、
+`target_concentrations` 为空或浓度为负、未知字段等）返回 FastAPI 标准
+`422` 结构。
+
 `TUBE_OVER_CAPACITY` 的失败响应示例（time_batch，同管同时收发、与数组
 顺序无关）：
 
@@ -498,14 +596,16 @@ curl "http://localhost:8000/api/simulations?status=failed"
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由（创建 / 查询 / 列表 / 健康检查）
+│   ├── main.py        # FastAPI 路由（创建 / 查询 / 列表 / 配比 / 健康检查）
 │   ├── models.py      # Pydantic 请求与响应模型、时间解析
 │   ├── engine.py      # 混样模拟核心（浓度 / 来源 / 移液损耗 / 守恒 / 管容量）
+│   ├── blend.py       # 两源管混样配比求解（质量守恒联立 + 可行性校验）
 │   └── database.py    # SQLite 连接与记录持久化
 ├── tests/
 │   ├── conftest.py
 │   ├── test_engine.py # 引擎计算、损耗 / 来源 / 守恒、time_batch 原子批次、管容量与错误定位
-│   └── test_api.py    # API 端到端（含损耗追踪、time_batch、管容量 / OpenAPI 与持久化）
+│   ├── test_api.py    # API 端到端（含损耗追踪、time_batch、管容量 / OpenAPI 与持久化）
+│   └── test_blend_plan.py # blend-plan 配比接口（求解、各类无解错误、校验与 OpenAPI）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

@@ -9,8 +9,14 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Query, status
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from . import database, engine
-from .models import SimulationList, SimulationRequest, SimulationResult
+from . import blend, database, engine
+from .models import (
+    BlendPlanRequest,
+    BlendPlanResult,
+    SimulationList,
+    SimulationRequest,
+    SimulationResult,
+)
 
 
 @asynccontextmanager
@@ -31,8 +37,12 @@ app = FastAPI(
         "同一时刻的连续转移按批原子执行：吸取均基于批次开始快照，"
         "先按源管汇总校验可用量，再按批末净体积统一校验各管 max_volume，"
         "然后统一写入，结果与数组顺序无关；任一管超容整批不落地。"
+        "此外支持从成功模拟的末态反推混样方案"
+        "（POST /api/simulations/{sim_id}/blend-plan）：给定目标体积与"
+        "目标各标记物浓度，联立所有标记物的质量守恒方程求解两支源管的"
+        "两路取样量，并返回预计浓度与取样后剩余体积。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -143,3 +153,98 @@ def list_simulations(
     if status_filter:
         items = [item for item in items if item["status"] == status_filter]
     return SimulationList(items=items, limit=limit, offset=offset)
+
+
+@app.post(
+    "/api/simulations/{sim_id}/blend-plan",
+    tags=["混样规划"],
+    response_model=BlendPlanResult,
+    responses={
+        200: {"model": BlendPlanResult, "description": "求解成功，返回两路取样方案"},
+        400: {
+            "model": BlendPlanResult,
+            "description": "目标无解 / 取样量超可用体积 / 模拟未成功 / 源管不存在",
+        },
+        404: {"description": "模拟记录不存在"},
+        422: {"description": "请求体格式 / 字段校验失败（FastAPI 标准错误结构）"},
+    },
+    summary="从成功模拟末态反推两源管混样取样方案",
+)
+def create_blend_plan(
+    sim_id: str,
+    request: BlendPlanRequest,
+    db: sqlite3.Connection = Depends(get_db),
+) -> JSONResponse:
+    """联立质量守恒方程反推两路取样量（纯计算，不修改模拟记录）。
+
+    从指定**成功**模拟的末态中取 ``sources`` 两支源管，联立体积守恒
+    （两路取样量之和 = ``target_volume``）与每种标记物的质量守恒方程求解；
+    缺失标记物按 0 处理。成功返回 ``200`` 与两路取样量、预计各标记物浓度、
+    取样后剩余体积；目标无解（方程不一致 / 取样量为负 / 超出可用体积）、
+    模拟未成功或源管不存在时返回 ``400``，``error`` 给出错误码与定位信息
+    （如 ``body.target_concentrations.GFP``、``body.sources[0]``）。
+    """
+    record = database.get_simulation(db, sim_id)
+    if record is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "detail": {
+                    "code": "SIMULATION_NOT_FOUND",
+                    "message": f"未找到 id 为 {sim_id!r} 的模拟记录",
+                    "location": "path.sim_id",
+                }
+            },
+        )
+
+    def _envelope(result: dict) -> dict:
+        return {
+            "simulation_id": sim_id,
+            "target_volume": request.target_volume,
+            "target_concentrations": request.target_concentrations,
+            **result,
+        }
+
+    def _reject(code: str, message: str, location: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=_envelope(
+                {
+                    "status": "failed",
+                    "aliquots": [],
+                    "expected_concentrations": {},
+                    "error": {"code": code, "message": message, "location": location},
+                }
+            ),
+        )
+
+    if record["status"] != "success":
+        return _reject(
+            "SIMULATION_NOT_SUCCESSFUL",
+            f"模拟 {sim_id!r} 的状态为 {record['status']!r}，"
+            "只有成功的模拟才能用于混样规划",
+            "path.sim_id",
+        )
+
+    final_states = {tube["id"]: tube for tube in record["final_states"]}
+    for index, source in enumerate(request.sources):
+        if source not in final_states:
+            return _reject(
+                "SOURCE_TUBE_NOT_FOUND",
+                f"模拟 {sim_id!r} 的末态中不存在管 {source!r}"
+                f"（可用管：{sorted(final_states)}）",
+                f"body.sources[{index}]",
+            )
+
+    result = blend.plan_blend(
+        final_states[request.sources[0]],
+        final_states[request.sources[1]],
+        request.target_volume,
+        request.target_concentrations,
+    )
+    http_status = (
+        status.HTTP_200_OK
+        if result["status"] == "success"
+        else status.HTTP_400_BAD_REQUEST
+    )
+    return JSONResponse(content=_envelope(result), status_code=http_status)

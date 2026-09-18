@@ -18,7 +18,12 @@
   `delivered_amount`，按批末净体积统一校验，同管同时收发也与数组顺序无关。
   任一管超容则**整批不落地**并返回 400；未配置容量的旧请求行为不变；
 * 两个口径的守恒量：含 waste 的**系统总量差**（应恒为 0）与仅看管内的
-  **管内体积 / 质量变化**（恰好等于累计损耗）。
+  **管内体积 / 质量变化**（恰好等于累计损耗）；
+* **混样规划反解**（`POST /api/simulations/{id}/blend-plan`）：从成功模拟的
+  末态中选两支源管，按 `target_volume` 与 `target_concentrations` 联立所有
+  标记物的质量守恒方程反推两路取样量，返回预计各标记物浓度与取样后剩余
+  体积；缺失标记物按 0 处理，目标无解（方程不一致 / 取样量为负 / 超出可用
+  体积）时返回带定位信息的结构化错误。
 
 转移量超出当前可用体积、注入后超过管容量（`max_volume`）、时间逆序、引用
 未声明的样本时，返回 **HTTP 400** 和定位明确的结构化错误（如
@@ -65,6 +70,7 @@ docker compose up --build
 `http://localhost:8000/openapi.json`（其中 `info.version` 随服务版本更新，
 `SimulationRequest.execution_mode`、`StepOut.batch_index`、
 `SampleIn.max_volume` 与 `TubeStateOut.max_volume` / `remaining_capacity`
+以及 blend-plan 的 `BlendPlanRequest` / `BlendPlanResult`
 均已包含在 schema 中），交互式文档在 `/docs`、`/redoc`。
 
 ### 启动后的示例（含移液损耗追踪）
@@ -185,6 +191,87 @@ curl -s -X POST http://localhost:8000/api/simulations \
 * 容量按**实际入管量** `delivered_amount` 判断：吸出多、损耗大时只要入管后
   不超容即合法（恰好等于 `max_volume` 也合法）。
 
+### 启动后的示例（混样规划 blend-plan）
+
+`POST /api/simulations/{id}/blend-plan` 从**成功**模拟的末态中选两支源管，
+按目标体积 `target_volume` 与目标浓度 `target_concentrations` 联立**所有
+标记物的质量守恒方程**（`c1·v1 + c2·v2 = t·target_volume`，外加体积守恒
+`v1 + v2 = target_volume`）反推两路取样量；源管或目标中缺失的标记物一律
+按 0 处理。该接口只做计算，不修改已保存的模拟记录。
+
+```bash
+# 1) 先提交一次模拟并记下返回的 id（S1 只含 GFP，S2 只含 RFP）
+curl -s -X POST http://localhost:8000/api/simulations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "blend-plan 原料管",
+    "samples": [
+      {"id": "S1", "initial_volume": 100, "markers": {"GFP": 10}},
+      {"id": "S2", "initial_volume": 100, "markers": {"RFP": 5}}
+    ],
+    "transfers": []
+  }'
+
+# 2) 反推：配 40 体积、GFP=5 / RFP=2.5 的混合液
+curl -s -X POST http://localhost:8000/api/simulations/<id>/blend-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sources": ["S1", "S2"],
+    "target_volume": 40,
+    "target_concentrations": {"GFP": 5, "RFP": 2.5}
+  }' | python3 -m json.tool
+```
+
+成功响应（200）：两路各取 20，取样后两管各剩 80。
+
+```json
+{
+  "simulation_id": "<id>",
+  "status": "success",
+  "target_volume": 40.0,
+  "target_concentrations": {"GFP": 5.0, "RFP": 2.5},
+  "aliquots": [
+    {"source": "S1", "volume": 20.0, "remaining_volume": 80.0},
+    {"source": "S2", "volume": 20.0, "remaining_volume": 80.0}
+  ],
+  "expected_concentrations": {"GFP": 5.0, "RFP": 2.5},
+  "error": null
+}
+```
+
+目标自相矛盾时（例如 `{"GFP": 5, "RFP": 1}`：GFP 要求 S1/S2 各取 20，
+而 RFP 要求只从 S2 取 8）返回 **400** 并定位到矛盾的标记物方程：
+
+```json
+{
+  "simulation_id": "<id>",
+  "status": "failed",
+  "target_volume": 40.0,
+  "target_concentrations": {"GFP": 5.0, "RFP": 1.0},
+  "aliquots": [],
+  "expected_concentrations": {},
+  "error": {
+    "code": "BLEND_TARGET_INCONSISTENT",
+    "message": "按标记物 'GFP' 解得两路取样量后，标记物 'RFP' 的质量守恒不成立：混合后质量为 100.0，目标要求 40.0（浓度 2.5 ≠ 1.0）",
+    "location": "body.target_concentrations.RFP"
+  }
+}
+```
+
+要点：
+
+* 求解取两管浓度**相对差最大**的标记物方程与体积方程联立，再回代校验其余
+  所有标记物方程（相对容差 1e-9），任一不成立即拒绝；
+* 目标未列出但源管中存在的标记物按目标 0 处理——例如源管含 RFP 而目标只写
+  GFP，则任何会带入 RFP 的方案都判定无解；
+* 目标浓度落在两管浓度区间之外时解出负取样量（`BLEND_NEGATIVE_ALIQUOT`）；
+  取样量超过源管末态可用体积时拒绝（`BLEND_INSUFFICIENT_VOLUME`）；
+* 两支源管所有标记物浓度相同时方程组退化，无法唯一确定取样量
+  （`BLEND_UNDERDETERMINED`）；
+* 仅**成功**的模拟可用于规划（否则 `SIMULATION_NOT_SUCCESSFUL`）；模拟不
+  存在返回 404（`SIMULATION_NOT_FOUND`），源管不在末态中返回 400
+  （`SOURCE_TUBE_NOT_FOUND`，`location` 形如 `body.sources[1]`）。
+
 ---
 
 ## 本地开发（不使用 Docker）
@@ -270,6 +357,17 @@ pytest -q
       * 某批失败时仅该批不落地，之前批次已提交的步骤与状态保留
         （`TIME_NOT_ORDERED` / `UNKNOWN_SAMPLE` / `SAME_SOURCE_TARGET`
         / `TUBE_OVER_CAPACITY` 同理，下标均指向原 transfers 序列）。
+11. **混样规划（blend-plan）**：`POST /api/simulations/{id}/blend-plan` 从
+    **成功**模拟的末态中取两支源管，联立体积守恒（两路取样量之和 =
+    `target_volume`）与每种标记物的质量守恒
+    （`c1·v1 + c2·v2 = t·target_volume`）求解两路取样量；源管或目标中
+    缺失的标记物浓度一律按 0 处理。取两管浓度相对差最大的标记物方程与
+    体积方程联立求解，再回代校验其余方程（相对容差 1e-9）：任一不成立即
+    拒绝（`BLEND_TARGET_INCONSISTENT`）；两管所有标记物浓度相同则方程组
+    退化（`BLEND_UNDERDETERMINED`）。解出后校验取样量非负
+    （`BLEND_NEGATIVE_ALIQUOT`）且不超过源管末态可用体积
+    （`BLEND_INSUFFICIENT_VOLUME`）。该接口只做计算，不修改、不新增
+    持久化记录。
 
 标记物支持两种写法，可混用：
 
@@ -285,6 +383,7 @@ pytest -q
 | `POST` | `/api/simulations` | 提交一次模拟（成功 201，业务失败 400，格式错误 422） |
 | `GET` | `/api/simulations/{id}` | 查询某次模拟的完整逐步结果（失败记录返回 400） |
 | `GET` | `/api/simulations` | 历史记录列表，支持 `limit` / `offset` / `status` |
+| `POST` | `/api/simulations/{id}/blend-plan` | 从成功模拟末态反推两源管混样方案（成功 200，目标无解等业务失败 400，模拟不存在 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 请求示例
@@ -456,7 +555,13 @@ time_batch 下若同批对同一源管的合计吸取量超过其批次开始体
 | `TIME_NOT_ORDERED` | 转移时间早于上一批转移 | `transfers[i].time` |
 | `UNKNOWN_SAMPLE` | 源 / 目标管未在 `samples` 中声明 | `transfers[i].source` / `.target` |
 | `SAME_SOURCE_TARGET` | 源管与目标管相同 | `transfers[i]` |
-| `SIMULATION_NOT_FOUND` | 查询不存在的记录 id | `path.sim_id` |
+| `SIMULATION_NOT_FOUND` | 查询 / 规划不存在的记录 id | `path.sim_id` |
+| `SIMULATION_NOT_SUCCESSFUL` | blend-plan 引用的模拟状态为 failed | `path.sim_id` |
+| `SOURCE_TUBE_NOT_FOUND` | blend-plan 指定的源管不在该模拟末态中 | `body.sources[i]` |
+| `BLEND_TARGET_INCONSISTENT` | 各标记物质量守恒方程互相矛盾（含目标未列出但源管存在的标记物按 0 处理后不成立、目标含源管没有的标记物等） | `body.target_concentrations.<marker>` |
+| `BLEND_UNDERDETERMINED` | 两支源管所有标记物浓度相同，取样比例无法唯一确定 | `body.sources` |
+| `BLEND_NEGATIVE_ALIQUOT` | 解出的取样量为负（目标浓度落在两管浓度区间之外） | `body.target_concentrations.<marker>` |
+| `BLEND_INSUFFICIENT_VOLUME` | 解出的取样量超过源管末态可用体积 | `body.sources[i]` |
 
 `TUBE_OVER_CAPACITY` 的失败响应示例（time_batch，同管同时收发、与数组
 顺序无关）：
@@ -498,14 +603,16 @@ curl "http://localhost:8000/api/simulations?status=failed"
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由（创建 / 查询 / 列表 / 健康检查）
+│   ├── main.py        # FastAPI 路由（创建 / 查询 / 列表 / 混样规划 / 健康检查）
 │   ├── models.py      # Pydantic 请求与响应模型、时间解析
 │   ├── engine.py      # 混样模拟核心（浓度 / 来源 / 移液损耗 / 守恒 / 管容量）
+│   ├── blend.py       # 两源管混样反解（质量守恒联立求解、可行性校验）
 │   └── database.py    # SQLite 连接与记录持久化
 ├── tests/
 │   ├── conftest.py
 │   ├── test_engine.py # 引擎计算、损耗 / 来源 / 守恒、time_batch 原子批次、管容量与错误定位
-│   └── test_api.py    # API 端到端（含损耗追踪、time_batch、管容量 / OpenAPI 与持久化）
+│   ├── test_api.py    # API 端到端（含损耗追踪、time_batch、管容量 / OpenAPI 与持久化）
+│   └── test_blend_plan.py # blend-plan 接口与求解器（成功 / 无解场景与错误定位）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -519,6 +626,8 @@ curl "http://localhost:8000/api/simulations?status=failed"
   busy timeout 以兼容多 worker 部署。
 * **失败也持久化**：成功和失败的模拟都落库，失败记录保留已执行步骤与
   现场状态，方便审计与复盘。
+* **混样规划纯计算**：blend-plan 只读取成功模拟的末态做方程求解，不修改
+  模拟记录、不新增持久化数据；目标无解时返回带定位信息的结构化错误。
 * **浓度统一在质量域计算**：避免反复稀释 / 混合引入的累积误差；
   `conservation.*_difference`（含 waste 的系统口径）恒为 0，可直接用于
   自动校验，`tube_*_change` 则给出仅管内口径的下降量，便于核对损耗账。
